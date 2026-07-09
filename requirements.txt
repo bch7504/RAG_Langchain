@@ -1,0 +1,27 @@
+# Core LangChain (1.x)
+langchain==1.3.11
+langchain-core==1.4.8
+langchain-community==0.4.2
+langchain-text-splitters==1.1.2
+
+# LLM & Embeddings providers
+langchain-google-genai
+langchain-huggingface
+
+# Vector store
+langchain-milvus==0.3.3
+
+# Agent framework
+langgraph
+
+# Retriever
+rank-bm25
+
+# Web crawling & parsing
+beautifulsoup4
+
+# Web UI
+streamlit
+
+# Environment variables
+python-dotenv
