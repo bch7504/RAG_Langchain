@@ -7,9 +7,43 @@ from dotenv import load_dotenv
 from uuid import uuid4
 from crawl import crawl_web
 from langchain_ollama import OllamaEmbeddings
-from pymilvus import connections
+from pymilvus import MilvusClient, connections
+
 
 load_dotenv()
+
+def _ensure_orm_connection(vectorstore: Milvus):
+    """
+    Workaround cho bug langchain-milvus 0.3.3 + pymilvus 2.6.x:
+    MilvusClient tạo connection nội bộ nhưng không đăng ký với pymilvus ORM,
+    nên Collection() không tìm thấy alias và raise ConnectionNotExistException.
+    Hàm này đăng ký ORM connection với alias mà MilvusClient đang dùng.
+    """
+    alias = vectorstore.alias
+    # Kiểm tra xem alias đã được đăng ký trong ORM chưa
+    if alias not in connections.list_connections() or not connections.has_connection(alias):
+        # Lấy URI từ connection_args
+        uri = vectorstore._connection_args.get("uri", "http://localhost:19530")
+        connections.connect(alias=alias, uri=uri)
+
+def _get_embeddings(use_ollama: bool):
+    """Khởi tạo model embeddings dựa trên lựa chọn"""
+    if use_ollama:
+        return OllamaEmbeddings(
+            model="nomic-embed-text"  
+        )
+    else: 
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+def _drop_collection_if_exists(uri: str, collection_name: str):
+    """Xóa collection cũ nếu đã tồn tại (workaround bug drop_old langchain-milvus 0.3.x)"""
+    client = MilvusClient(uri=uri)
+    if client.has_collection(collection_name):
+        client.drop_collection(collection_name)
+        print(f'Dropped old collection: {collection_name}')
+    client.close()
 
 def load_data_from_local_file(filename: str, directory: str) -> tuple:
     """
@@ -44,14 +78,7 @@ def seed_milvus(URL_link: str, collection_name: str, filename: str, directory: s
         - Collection cũ sẽ bị xóa nếu đã tồn tại (drop_collection=true)
     """
     # Khởi tạo model embeddings
-    if use_ollama:
-        embeddings = OllamaEmbeddings(
-            model="nomic-embed-text"  
-        )
-    else: 
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+    embeddings = _get_embeddings(use_ollama)
     # Đọc dữ liệu từ file local
     local_data, doc_name = load_data_from_local_file(filename, directory)
     #Chuyển đổi dữ liệu thành danh sách các Document với giá trị mặc định cho các trường
@@ -75,19 +102,23 @@ def seed_milvus(URL_link: str, collection_name: str, filename: str, directory: s
     # Tạo id duy nhất cho mỗi document
     uuids = [str(uuid4()) for _ in range(len(documents))]
     
-    # Kết nối đến Milvus server trước
-    connections.connect("default", uri=URL_link)
-    # Khởi tạo và cấu hình Milvus vectorstore
+    # Xóa collection cũ trước (workaround bug drop_old trong langchain-milvus 0.3.x)
+    _drop_collection_if_exists(URL_link, collection_name)
+    
+    # Khởi tạo Milvus vectorstore (không dùng drop_old=True để tránh bug)
     vectorstore = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": URL_link},
         collection_name=collection_name,
-        drop_old=True # Xóa collection cũ nếu đã tồn tại
+        drop_old=False
     )
+    # Đăng ký ORM connection để tránh ConnectionNotExistException
+    _ensure_orm_connection(vectorstore)
     # Thêm documents vào vectorstore
     vectorstore.add_documents(documents, ids=uuids)
     print('vector:', vectorstore)
     return vectorstore
+
 def seed_milvus_live(url: str, URL_link: str, collection_name: str, doc_name: str,use_ollama:bool=False )-> Milvus:
     """
     Hàm crawl dữ liệu trực tiếp từ URL và lưu vectors embeddings vào Milvus
@@ -103,14 +134,7 @@ def seed_milvus_live(url: str, URL_link: str, collection_name: str, doc_name: st
         - Tự động gán metadata mặc định cho các trường thiếu
     """
     # Khởi tạo model embeddings
-    if use_ollama:
-        embeddings = OllamaEmbeddings(
-            model = "nomic-embed-text"
-        )
-    else:
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+    embeddings = _get_embeddings(use_ollama)
 
     # Đọc dữ liệu từ URL trực tiếp
     documents = crawl_web(url)
@@ -130,17 +154,21 @@ def seed_milvus_live(url: str, URL_link: str, collection_name: str, doc_name: st
         doc.metadata.update(metadata)
     
     uuids = [str(uuid4()) for _ in range(len(documents))]
-    # Kết nối đến Milvus server trước
-    connections.connect("default", uri=URL_link)
-    # Khởi tạo cấu hình Milvus
+
+    # Xóa collection cũ trước (workaround bug drop_old trong langchain-milvus 0.3.x)
+    _drop_collection_if_exists(URL_link, collection_name)
+    
+    # Khởi tạo Milvus vectorstore (không dùng drop_old=True để tránh bug)
     vectorstore = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": URL_link},
         collection_name=collection_name,
-        drop_old=True # Xóa collection cũ nếu đã tồn tại
+        drop_old=False
     )
-    #Thêm documents vào Milvus
-    vectorstore.add_documents(documents= documents, ids=uuids)
+    # Đăng ký ORM connection để tránh ConnectionNotExistException
+    _ensure_orm_connection(vectorstore)
+    # Thêm documents vào Milvus
+    vectorstore.add_documents(documents=documents, ids=uuids)
     print('vector:', vectorstore)
     return vectorstore
 
@@ -157,22 +185,16 @@ def connect_to_milvus(URL_link: str, collection_name: str,use_ollama=False) -> M
         - sử dụng model "nomic-embed-text" và "sentence-transformers/all-MiniLM-L6-v2" để tạo embeddings khi truy vấn
         
     """
-    if use_ollama:
-        embeddings = OllamaEmbeddings(
-            model = "nomic-embed-text"
-        )
-    else:
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-    # Kết nối đến Milvus server trước
-    connections.connect("default", uri=URL_link)
+    embeddings = _get_embeddings(use_ollama)
+
     # Khởi tạo cấu hình Milvus
     vectorstore = Milvus(
         embedding_function=embeddings,
         connection_args={"uri": URL_link},
         collection_name=collection_name
     )
+    # Đăng ký ORM connection để tránh ConnectionNotExistException
+    _ensure_orm_connection(vectorstore)
     return vectorstore
 def main():
     """
